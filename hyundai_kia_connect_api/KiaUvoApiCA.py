@@ -198,10 +198,21 @@ class KiaUvoApiCA(ApiImpl):
         # When MFA is required, the response structure is different
         if response_json.get("responseHeader", {}).get("responseCode") == 1:
             error = response_json.get("error", {})
+            error_code = error.get("errorCode")
+            _LOGGER.debug(f"{DOMAIN} - Login error code: {error_code}, full response: {response_json}")
+
             # Check if this is an MFA requirement (not a regular error)
-            if error.get("errorCode") == "7601":  # MFA required error code
+            if error_code == "7601":  # MFA required error code
                 # Extract MFA details from the response
+                # The MFA info might be in different places depending on the response
                 mfa_info = response_json.get("result", {}).get("mfaInfo", {})
+
+                # If mfaInfo is empty, try to get it from error object
+                if not mfa_info:
+                    mfa_info = error.get("mfaInfo", {})
+
+                _LOGGER.debug(f"{DOMAIN} - MFA Info: {mfa_info}")
+
                 return OTPRequest(
                     request_id=mfa_info.get("userInfoUuid", ""),
                     otp_key=None,  # CA doesn't use otp_key like USA
@@ -213,6 +224,7 @@ class KiaUvoApiCA(ApiImpl):
             else:
                 # Regular error, use standard error checking
                 self._check_response_for_errors(response_json)
+                return  # This line should never be reached due to exception above
 
         # Successful login without MFA
         self._check_response_for_errors(response_json)
