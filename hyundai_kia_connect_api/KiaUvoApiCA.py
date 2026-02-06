@@ -15,7 +15,7 @@ import requests.packages.urllib3.util.connection as urllib3_cn
 
 # Try to fix hyundai/cloudflare
 
-from .ApiImpl import ApiImpl, ClimateRequestOptions
+from .ApiImpl import ApiImpl, ClimateRequestOptions, OTPRequest
 from .const import (
     BRAND_GENESIS,
     BRAND_HYUNDAI,
@@ -28,6 +28,7 @@ from .const import (
     SEAT_STATUS,
     TEMPERATURE_UNITS,
     VEHICLE_LOCK_ACTION,
+    OTP_NOTIFY_TYPE,
 )
 from .exceptions import APIError, AuthenticationError
 from .Token import Token
@@ -159,25 +160,25 @@ class KiaUvoApiCA(ApiImpl):
         """
 
         error_code_mapping = {"7404": AuthenticationError, "7402": AuthenticationError}
-        if response["responseHeader"]["responseCode"] == 1:
-            if response["error"]["errorCode"] in error_code_mapping:
-                raise error_code_mapping[response["error"]["errorCode"]](
-                    response["error"]["errorDesc"]
-                )
+        if response.get("responseHeader", {}).get("responseCode") == 1:
+            error = response.get("error", {})
+            error_code = error.get("errorCode")
+            error_desc = error.get("errorDesc", "Unknown error")
+            if error_code in error_code_mapping:
+                raise error_code_mapping[error_code](error_desc)
             else:
-                raise APIError(f"Server returned: '{response['error']['errorDesc']}'")
+                raise APIError(f"Server returned: '{error_desc}'")
 
     def login(
         self,
         username: str,
         password: str,
-        otp_handler: ty.Callable[[dict], dict] | None = None,
         pin: str | None = None,
-    ) -> Token:
+    ) -> Token | OTPRequest:
         # Sign In with Email and Password and Get Authorization Code
         url = self.API_URL + "v2/login"
         data = {"loginId": username, "password": password}
-        headers = self.API_HEADERS
+        headers = self.API_HEADERS.copy()
         headers.pop("accessToken", None)
         # Generate a random device ID to avoid static fingerprinting
         import uuid
@@ -191,12 +192,90 @@ class KiaUvoApiCA(ApiImpl):
         headers["Deviceid"] = base64.b64encode(unique_device_id.encode()).decode()
         response = self.sessions.post(url, json=data, headers=headers)
         _LOGGER.debug(f"{DOMAIN} - Sign In Response {response.text}")
-        response = response.json()
-        self._check_response_for_errors(response)
-        response = response["result"]["token"]
-        token_expire_in = int(response["expireIn"]) - 60
-        access_token = response["accessToken"]
-        refresh_token = response["refreshToken"]
+        response_json = response.json()
+
+        # Check if OTP/MFA is required
+        # When MFA is required, the response structure is different
+        if response_json.get("responseHeader", {}).get("responseCode") == 1:
+            error = response_json.get("error", {})
+            # Check if this is an MFA requirement (not a regular error)
+            if error.get("errorCode") == "7601":  # MFA required error code
+                # Extract MFA details from the response
+                mfa_info = response_json.get("result", {}).get("mfaInfo", {})
+                return OTPRequest(
+                    request_id=mfa_info.get("userInfoUuid", ""),
+                    otp_key=None,  # CA doesn't use otp_key like USA
+                    has_email=mfa_info.get("hasEmail", False),
+                    has_sms=mfa_info.get("hasSms", False),
+                    email=mfa_info.get("userAccount", username),
+                    sms=mfa_info.get("userPhone", ""),
+                )
+            else:
+                # Regular error, use standard error checking
+                self._check_response_for_errors(response_json)
+
+        # Successful login without MFA
+        self._check_response_for_errors(response_json)
+        token_data = response_json["result"]["token"]
+        token_expire_in = int(token_data["expireIn"]) - 60
+        access_token = token_data["accessToken"]
+        refresh_token = token_data["refreshToken"]
+
+        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+            seconds=token_expire_in
+        )
+
+        return Token(
+            username=username,
+            password=password,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            valid_until=valid_until,
+            pin=pin,
+        )
+
+    def send_otp(self, otp_request: OTPRequest, notify_type: OTP_NOTIFY_TYPE) -> None:
+        """Sends OTP to the user via selected destination"""
+        url = self.API_URL + "mfa/sendotp"
+        headers = self.API_HEADERS.copy()
+        data = {
+            "otpMethod": notify_type.value,
+            "mfaApiCode": "0107",
+            "userAccount": otp_request.email,
+            "userPhone": otp_request.sms,
+            "userInfoUuid": otp_request.request_id,
+        }
+
+        response = self.sessions.post(url, headers=headers, json=data)
+        _LOGGER.debug(f"{DOMAIN} - Send OTP Response {response.text}")
+        response_json = response.json()
+        self._check_response_for_errors(response_json)
+
+    def verify_otp_and_complete_login(
+        self,
+        username: str,
+        password: str,
+        otp_code: str,
+        otp_request: OTPRequest,
+        pin: str | None = None,
+    ) -> Token:
+        """Confirms OTP code sent to the user and completes login"""
+        url = self.API_URL + "mfa/validateotp"
+        headers = self.API_HEADERS.copy()
+        data = {
+            "userAccount": username,
+            "otpKey": otp_code,
+            "mfaApiCode": "0107",
+        }
+        response = self.sessions.post(url, headers=headers, json=data)
+        _LOGGER.debug(f"{DOMAIN} - Verify OTP Response {response.text}")
+        response_json = response.json()
+        self._check_response_for_errors(response_json)
+
+        token_data = response_json["result"]["token"]
+        token_expire_in = int(token_data["expireIn"]) - 60
+        access_token = token_data["accessToken"]
+        refresh_token = token_data["refreshToken"]
 
         valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
             seconds=token_expire_in
@@ -216,15 +295,15 @@ class KiaUvoApiCA(ApiImpl):
         # Use this api because it's likely checked more frequently than other APIs, less
         # chance to get banned. And it's short and simple.
         url = self.API_URL + "ntcmsgcnt"
-        headers = self.API_HEADERS
+        headers = self.API_HEADERS.copy()
         headers["accessToken"] = token.access_token
         response = self.sessions.post(url, headers=headers)
         _LOGGER.debug(f"{DOMAIN} - Test Token Response {response.text}")
         response = response.json()
         token_errors = ["7403", "7602"]
         if (
-            response["responseHeader"]["responseCode"] == 1
-            and response["error"]["errorCode"] in token_errors
+            response.get("responseHeader", {}).get("responseCode") == 1
+            and response.get("error", {}).get("errorCode") in token_errors
         ):
             return False
         return True
