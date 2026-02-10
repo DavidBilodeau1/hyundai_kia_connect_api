@@ -157,11 +157,15 @@ class KiaUvoApiCA(ApiImpl):
         - 0000: no error
         - 7404: "Wrong Username and password"
         - 7402: "Account Locked Out"
+        - 7110: "OTP Required" (MFA verification needed)
         :param response: the API's JSON response
         """
 
         error_code_mapping = {"7404": AuthenticationError, "7402": AuthenticationError}
         if response["responseHeader"]["responseCode"] == 1:
+            # Don't raise error for 7110 - it's handled in login method
+            if response["error"]["errorCode"] == "7110":
+                return
             if response["error"]["errorCode"] in error_code_mapping:
                 raise error_code_mapping[response["error"]["errorCode"]](
                     response["error"]["errorDesc"]
@@ -173,29 +177,56 @@ class KiaUvoApiCA(ApiImpl):
         self,
         username: str,
         password: str,
+        token: Token = None,
         pin: str | None = None,
     ) -> Token | OTPRequest:
         # Sign In with Email and Password and Get Authorization Code
         url = self.API_URL + "v2/login"
         data = {"loginId": username, "password": password}
-        headers = self.API_HEADERS
+        headers = self.API_HEADERS.copy()
         headers.pop("accessToken", None)
-        # Generate a random device ID to avoid static fingerprinting
 
-        # Base string simulating a mobile User-Agent
-        base_device_id = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
-        # Append a random UUID to make it unique per session
-        unique_device_id = f"{base_device_id}+{str(uuid.uuid4())}"
+        # Reuse device ID from stored token if available to avoid OTP prompt
+        if token and token.device_id:
+            device_id = token.device_id
+            _LOGGER.debug(f"{DOMAIN} - Reusing stored device ID to avoid OTP")
+        else:
+            # Generate a random device ID to avoid static fingerprinting
+            # Base string simulating a mobile User-Agent
+            base_device_id = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
+            # Append a random UUID to make it unique per session
+            unique_device_id = f"{base_device_id}+{str(uuid.uuid4())}"
+            device_id = base64.b64encode(unique_device_id.encode()).decode()
+            _LOGGER.debug(f"{DOMAIN} - Generated new device ID")
 
-        headers["Deviceid"] = base64.b64encode(unique_device_id.encode()).decode()
+        headers["Deviceid"] = device_id
         response = self.sessions.post(url, json=data, headers=headers)
         _LOGGER.debug(f"{DOMAIN} - Sign In Response {response.text}")
-        response = response.json()
-        self._check_response_for_errors(response)
-        response = response["result"]["token"]
-        token_expire_in = int(response["expireIn"]) - 60
-        access_token = response["accessToken"]
-        refresh_token = response["refreshToken"]
+        response_json = response.json()
+
+        # Check if OTP is required (error code 7110)
+        if (response_json["responseHeader"]["responseCode"] == 1 and
+            response_json.get("error", {}).get("errorCode") == "7110"):
+            _LOGGER.info(f"{DOMAIN} - OTP verification required for new device")
+            # Generate a UUID for this OTP session
+            user_info_uuid = str(uuid.uuid4())
+            return OTPRequest(
+                request_id=user_info_uuid,
+                otp_key=None,  # Will be set after send_otp
+                has_email=True,  # Assume email is available
+                has_sms=False,   # Phone may not be available
+                email=username,
+                sms=None,
+            )
+
+        # Check for other errors
+        self._check_response_for_errors(response_json)
+
+        # Normal login successful
+        response_data = response_json["result"]["token"]
+        token_expire_in = int(response_data["expireIn"]) - 60
+        access_token = response_data["accessToken"]
+        refresh_token = response_data["refreshToken"]
 
         valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
             seconds=token_expire_in
@@ -207,24 +238,39 @@ class KiaUvoApiCA(ApiImpl):
             access_token=access_token,
             refresh_token=refresh_token,
             valid_until=valid_until,
+            device_id=device_id,
             pin=pin,
         )
 
-    def send_otp(self, otp_request: OTPRequest, notify_type: OTP_NOTIFY_TYPE) -> None:
-        """Sends OTP to the user via selected destination and via"""
+    def send_otp(self, otp_request: OTPRequest, notify_type: OTP_NOTIFY_TYPE) -> str:
+        """Sends OTP to the user via selected destination and returns the otpKey"""
         url = self.API_URL + "mfa/sendotp"
-        headers = self.API_HEADERS
+        headers = self.API_HEADERS.copy()
         data = {
-            "otpMethod ": notify_type,
+            "otpMethod": "E" if notify_type == OTP_NOTIFY_TYPE.EMAIL else "S",
             "mfaApiCode": "0107",
             "userAccount": otp_request.email,
-            "userPhone": otp_request.sms,
+            "userPhone": otp_request.sms if otp_request.sms else "",
             "userInfoUuid": otp_request.request_id,
         }
 
         response = self.sessions.post(url, headers=headers, json=data)
         _LOGGER.debug(f"{DOMAIN} - Send OTP Response {response.text}")
-        response = response.json()
+        response_json = response.json()
+
+        # Check for errors
+        if response_json["responseHeader"]["responseCode"] != 0:
+            error_desc = response_json.get("error", {}).get("errorDesc", "Unknown error")
+            raise APIError(f"Failed to send OTP: {error_desc}")
+
+        # Extract and return the otpKey
+        otp_key = response_json["result"]["otpKey"]
+        _LOGGER.info(f"{DOMAIN} - OTP sent successfully via {notify_type.value}")
+
+        # Update the otp_request with the otpKey for later use
+        otp_request.otp_key = otp_key
+
+        return otp_key
 
     def verify_otp_and_complete_login(
         self,
@@ -234,26 +280,85 @@ class KiaUvoApiCA(ApiImpl):
         otp_request: OTPRequest,
         pin: str | None = None,
     ) -> Token:
-        """Confirms OTP code sent to the user"""
+        """Confirms OTP code sent to the user and completes login"""
         url = self.API_URL + "mfa/validateotp"
-        headers = self.API_HEADERS
+        headers = self.API_HEADERS.copy()
         data = {
-            # "otpNo ": otp_code, # Need to figure out number
+            "otpNo": otp_code,  # The 6-digit OTP code
             "userAccount": username,
-            "otpKey": otp_code,
+            "otpKey": otp_request.otp_key,  # The otpKey from send_otp response
             "mfaApiCode": "0107",
         }
+
         response = self.sessions.post(url, headers=headers, json=data)
         _LOGGER.debug(f"{DOMAIN} - Verify OTP Response {response.text}")
-        response = response.json()
+        response_json = response.json()
+
+        # Check for errors
+        if response_json["responseHeader"]["responseCode"] != 0:
+            error_desc = response_json.get("error", {}).get("errorDesc", "Invalid OTP code")
+            raise AuthenticationError(f"OTP verification failed: {error_desc}")
+
+        # Check if OTP was verified successfully
+        if not response_json["result"].get("verifiedOtp", False):
+            raise AuthenticationError("OTP verification failed: OTP code is invalid")
+
+        # Get the otpValidationKey
+        otp_validation_key = response_json["result"]["otpValidationKey"]
+        _LOGGER.info(f"{DOMAIN} - OTP verified successfully")
+
+        # Now complete the login with the otpValidationKey
+        login_url = self.API_URL + "v2/login"
+        login_data = {"loginId": username, "password": password}
+        login_headers = self.API_HEADERS.copy()
+        login_headers.pop("accessToken", None)
+
+        # Use the otpValidationKey to complete authentication
+        login_headers["otpValidationKey"] = otp_validation_key
+
+        # Generate a random device ID to avoid static fingerprinting
+        base_device_id = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
+        unique_device_id = f"{base_device_id}+{str(uuid.uuid4())}"
+        device_id = base64.b64encode(unique_device_id.encode()).decode()
+        login_headers["Deviceid"] = device_id
+
+        login_response = self.sessions.post(login_url, json=login_data, headers=login_headers)
+        _LOGGER.debug(f"{DOMAIN} - Complete Login Response {login_response.text}")
+        login_response_json = login_response.json()
+
+        # Check for errors in final login
+        if login_response_json["responseHeader"]["responseCode"] != 0:
+            error_desc = login_response_json.get("error", {}).get("errorDesc", "Login failed")
+            raise AuthenticationError(f"Login after OTP verification failed: {error_desc}")
+
+        # Extract token information
+        token_data = login_response_json["result"]["token"]
+        token_expire_in = int(token_data["expireIn"]) - 60
+        access_token = token_data["accessToken"]
+        refresh_token = token_data["refreshToken"]
+
+        valid_until = dt.datetime.now(dt.timezone.utc) + dt.timedelta(
+            seconds=token_expire_in
+        )
+
         return Token(
             username=username,
             password=password,
-            access_token=response["result"]["token"]["accessToken"],
-            refresh_token=response["result"]["token"]["refreshToken"],
-            valid_until=dt.datetime.now(dt.timezone.utc)
-            + dt.timedelta(seconds=int(response["result"]["token"]["expireIn"]) - 60),
+            access_token=access_token,
+            refresh_token=refresh_token,
+            valid_until=valid_until,
+            device_id=device_id,
             pin=pin,
+        )
+
+    def refresh_access_token(self, token: Token) -> Token | OTPRequest:
+        """Refresh the token using the refresh token, reusing device_id to avoid OTP"""
+        _LOGGER.debug(f"{DOMAIN} - Refreshing access token")
+        return self.login(
+            username=token.username,
+            password=token.password,
+            token=token,  # Pass the token to reuse device_id
+            pin=token.pin,
         )
 
     def test_token(self, token: Token) -> bool:
