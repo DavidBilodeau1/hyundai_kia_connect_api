@@ -137,6 +137,9 @@ class KiaUvoApiCA(ApiImpl):
         }
         self._sessions = None
 
+        # Generate a device ID once on initialization
+        self.device_id = base64.b64encode(str(uuid.uuid4()).encode()).decode()
+
     def get_implementation_by_region_brand(self, region, brand, language):
         return KiaUvoApiCA(region, brand, language)
 
@@ -187,18 +190,13 @@ class KiaUvoApiCA(ApiImpl):
         headers = self.API_HEADERS.copy()
         headers.pop("accessToken", None)
 
-        # Reuse device ID from stored token if available to avoid OTP prompt
+        # Reuse device ID from stored token if available, otherwise use instance device_id
         if token and token.device_id:
             device_id = token.device_id
             _LOGGER.debug(f"{DOMAIN} - Reusing stored device ID to avoid OTP")
         else:
-            # Generate a random device ID to avoid static fingerprinting
-            # Base string simulating a mobile User-Agent
-            base_device_id = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36"
-            # Append a random UUID to make it unique per session
-            unique_device_id = f"{base_device_id}+{str(uuid.uuid4())}"
-            device_id = base64.b64encode(unique_device_id.encode()).decode()
-            _LOGGER.debug(f"{DOMAIN} - Generated new device ID")
+            device_id = self.device_id
+            _LOGGER.debug(f"{DOMAIN} - Using instance device ID")
 
         headers["Deviceid"] = device_id
         response = self.sessions.post(url, json=data, headers=headers)
