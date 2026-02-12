@@ -188,7 +188,6 @@ class KiaUvoApiCA(ApiImpl):
         url = self.API_URL + "v2/login"
         data = {"loginId": username, "password": password}
         headers = self.API_HEADERS.copy()
-        headers.pop("accessToken", None)
 
         # Reuse device ID from stored token if available, otherwise use instance device_id
         if token and token.device_id:
@@ -199,6 +198,18 @@ class KiaUvoApiCA(ApiImpl):
             _LOGGER.debug(f"{DOMAIN} - Using instance device ID")
 
         headers["Deviceid"] = device_id
+
+        # If we have an access token and refresh token, include them to refresh the session
+        if token and token.access_token:
+            _LOGGER.debug(f"{DOMAIN} - Attempting login with stored access token")
+            headers["accessToken"] = token.access_token
+        else:
+            headers.pop("accessToken", None)
+
+        if token and token.refresh_token:
+            _LOGGER.debug(f"{DOMAIN} - Including refresh token in request")
+            data["refreshToken"] = token.refresh_token
+
         response = self.sessions.post(url, json=data, headers=headers)
         _LOGGER.debug(f"{DOMAIN} - Sign In Response {response.text}")
         response_json = response.json()
@@ -344,7 +355,7 @@ class KiaUvoApiCA(ApiImpl):
             "otpEmail": otp_request.email,
             "mfaApiCode": "0107",
             "otpValidationKey": otp_validation_key,
-            "mfaYn": "N",
+            "mfaYn": "Y",
         }
 
         genmfatkn_response = self.sessions.post(
